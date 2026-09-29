@@ -1,0 +1,320 @@
+"""20 historical ShopLite incidents from the six weeks before DéjàVu existed.
+
+Each fault the chaos panel can inject has at least one past twin here, and the DB connection leak
+happened twice (both times someone first tried "restart the pods", which only bought minutes).
+Timeline entries: (minutes after the alert, actor, action, outcome) with outcome "worked",
+"failed" or None for purely diagnostic steps.
+"""
+
+ENGINEERS = {
+    "Priya Raman": "Backend / database",
+    "Marcus Chen": "Catalog & performance",
+    "Aisha Okafor": "Payments",
+    "Diego Alvarez": "Release engineering",
+    "Sofia Lindqvist": "Infrastructure / SRE",
+    "Kenji Watanabe": "Data & exports",
+    "Tomás Silva": "Junior on-call rotation",
+}
+
+INCIDENTS = [
+    {
+        "id": "INC-2031", "days_ago": 41, "hour": 2, "service": "export-api", "affected": ["export-api"],
+        "severity": "SEV3", "title": "Nightly order export p95 latency 9s", "signature": "HighLatency",
+        "version": "v2.0.9", "owner": "Kenji Watanabe", "diagnose_min": 55, "resolve_min": 80,
+        "alert": "export-api p95 latency 9120 ms over 30s window (threshold 1500 ms); 0% 5xx. "
+                 "Slow query log: SELECT ... FROM orders ORDER BY created_at DESC LIMIT 100 took 8.7s (seq scan, 2.1M rows).",
+        "timeline": [
+            (10, "Tomás Silva", "Raised the export worker timeout from 10s to 30s.", "failed"),
+            (35, "Kenji Watanabe", "Ran EXPLAIN ANALYZE on the export query: sequential scan on orders, no index on created_at.", None),
+            (62, "Kenji Watanabe", "Created index orders_created_at_idx CONCURRENTLY.", "worked"),
+        ],
+        "root_cause": "Missing index on orders.created_at; the export query did a full table scan once orders passed 2M rows.",
+        "fix": "CREATE INDEX CONCURRENTLY orders_created_at_idx ON orders (created_at DESC).",
+        "postmortem": "Raising timeouts hid the symptom. Action items: add slow-query alerting at 1s; review "
+                      "query plans for every new ORDER BY in export code.",
+    },
+    {
+        "id": "INC-2032", "days_ago": 39, "hour": 14, "service": "checkout-api", "affected": ["checkout-api"],
+        "severity": "SEV1", "title": "Checkout failing: payment gateway timeouts", "signature": "PaymentGatewayTimeout",
+        "version": "v2.1.0", "owner": "Aisha Okafor", "diagnose_min": 38, "resolve_min": 62,
+        "alert": "checkout-api 64% 5xx (504) over 30s; p95 3040 ms. PaymentGatewayTimeout: POST "
+                 "https://api.payfast.example/v1/charges timed out after 3.0s (read timeout).",
+        "timeline": [
+            (8, "Tomás Silva", "Raised the PayFast client timeout from 3s to 10s.", "failed"),
+            (15, "Tomás Silva", "Observed worker threads piling up waiting on PayFast; catalog-api latency also rose because workers were exhausted.", None),
+            (38, "Aisha Okafor", "Confirmed on the PayFast status page: degraded performance in eu-west.", None),
+            (45, "Aisha Okafor", "Reverted the timeout to 3s, enabled the payments circuit breaker and failed over to the backup provider PayBridge.", "worked"),
+        ],
+        "root_cause": "Upstream degradation at PayFast (eu-west); checkout had no automatic failover.",
+        "fix": "Keep the 3s timeout, open the payments circuit breaker (PAYMENTS_CIRCUIT_OPEN=true) and route charges to PayBridge until PayFast recovers.",
+        "postmortem": "Raising the timeout made it worse: threads blocked 10s each and starved the whole app. "
+                      "Action items: automate the circuit breaker at 30% timeout rate; document PayBridge failover.",
+    },
+    {
+        "id": "INC-2033", "days_ago": 37, "hour": 9, "service": "catalog-api", "affected": ["catalog-api"],
+        "severity": "SEV2", "title": "Product images broken: TLS certificate expired", "signature": "SSLError",
+        "version": "v2.1.0", "owner": "Sofia Lindqvist", "diagnose_min": 25, "resolve_min": 40,
+        "alert": "catalog-api 31% 5xx. SSLError: certificate has expired (_ssl.c:1006) calling img.shoplite.internal.",
+        "timeline": [
+            (6, "Marcus Chen", "Purged the CDN cache for product images.", "failed"),
+            (25, "Sofia Lindqvist", "Found the cert-manager renewal job had been failing for 3 weeks (DNS-01 challenge credentials rotated).", None),
+            (33, "Sofia Lindqvist", "Fixed the DNS credentials and forced certificate renewal.", "worked"),
+        ],
+        "root_cause": "cert-manager could not renew the internal image certificate after DNS credentials were rotated.",
+        "fix": "Update the cert-manager DNS-01 secret and force renewal (cmctl renew img-shoplite-internal).",
+        "postmortem": "Add an alert for certificates expiring within 14 days and for failing renewal jobs.",
+    },
+    {
+        "id": "INC-2034", "days_ago": 35, "hour": 11, "service": "checkout-api",
+        "affected": ["catalog-api", "checkout-api", "export-api"],
+        "severity": "SEV1", "title": "All routes 503: database connection pool exhausted", "signature": "TimeoutError",
+        "version": "v2.1.2", "owner": "Priya Raman", "diagnose_min": 64, "resolve_min": 95,
+        "alert": "catalog-api, checkout-api and export-api 503s (58% 5xx). TimeoutError: QueuePool limit of size 5 "
+                 "overflow 0 reached, connection timed out, timeout 2.00. db_pool_in_use pinned at 5.",
+        "timeline": [
+            (6, "Priya Raman", "Restarted all ShopLite pods.", "failed"),
+            (15, "Priya Raman", "Errors returned 9 minutes after the restart; pool filled up again.", None),
+            (20, "Sofia Lindqvist", "Raised the pool size from 5 to 20.", "failed"),
+            (45, "Sofia Lindqvist", "Pool of 20 exhausted after 25 minutes and Postgres began warning about max_connections.", None),
+            (64, "Priya Raman", "pg_stat_activity showed dozens of connections 'idle in transaction' from the order report code path; found a Session opened without a context manager, never closed on the error branch.", None),
+            (80, "Priya Raman", "Wrapped the report query in `with Session(engine)`, deployed v2.1.3, reverted pool size to 5.", "worked"),
+        ],
+        "root_cause": "Connection leak: the order report code path opened DB sessions without closing them on the error branch, so every failed report leaked a pooled connection.",
+        "fix": "Find the leaking code path via pg_stat_activity ('idle in transaction'), close sessions with a context manager/finally, deploy, then restart once to release leaked connections.",
+        "postmortem": "Restarting pods and enlarging the pool only bought minutes and risked exhausting Postgres. "
+                      "Signal to look for: db_pool_in_use pinned at the pool size while traffic is normal. "
+                      "Action items: alert on pool saturation; lint rule forbidding bare Session().",
+    },
+    {
+        "id": "INC-2035", "days_ago": 33, "hour": 16, "service": "checkout-api", "affected": ["checkout-api"],
+        "severity": "SEV2", "title": "Checkout 500s after v2.2.0 deploy", "signature": "AttributeError",
+        "version": "v2.2.0", "owner": "Diego Alvarez", "diagnose_min": 14, "resolve_min": 47,
+        "alert": "checkout-api 27% 5xx right after deploy v2.2.0. AttributeError: 'NoneType' object has no attribute 'discount_code'.",
+        "timeline": [
+            (14, "Diego Alvarez", "Linked the errors to v2.2.0's new discount field (null for guest carts).", None),
+            (20, "Diego Alvarez", "Shipped hotfix v2.2.1 forward with a null check.", "failed"),
+            (32, "Diego Alvarez", "v2.2.1 broke order confirmation emails; errors rose to 40%.", None),
+            (38, "Diego Alvarez", "Rolled back to v2.1.3.", "worked"),
+        ],
+        "root_cause": "v2.2.0 assumed every cart has a discount object; guest carts do not.",
+        "fix": "Roll back to the last good version immediately, then fix forward calmly.",
+        "postmortem": "Fixing forward under pressure made it worse. Policy: when errors start right after a deploy, roll back first.",
+    },
+    {
+        "id": "INC-2036", "days_ago": 31, "hour": 20, "service": "catalog-api", "affected": ["catalog-api"],
+        "severity": "SEV3", "title": "Catalog latency from scraper bot traffic", "signature": "HighLatency",
+        "version": "v2.2.2", "owner": "Marcus Chen", "diagnose_min": 30, "resolve_min": 50,
+        "alert": "catalog-api p95 2300 ms, request rate 14x normal from a small set of IPs.",
+        "timeline": [
+            (5, "Tomás Silva", "Scaled catalog-api from 3 to 12 pods.", "failed"),
+            (30, "Marcus Chen", "Identified a scraper hitting /products with rotating user agents from 3 subnets.", None),
+            (40, "Marcus Chen", "Added an edge rate-limit rule (60 req/min per IP) and blocked the subnets.", "worked"),
+        ],
+        "root_cause": "Aggressive scraper traffic.",
+        "fix": "Edge rate limiting per IP; block abusive subnets.",
+        "postmortem": "Scaling out only raised cost. Action item: default per-IP rate limits on public routes.",
+    },
+    {
+        "id": "INC-2037", "days_ago": 29, "hour": 13, "service": "catalog-api", "affected": ["catalog-api", "export-api"],
+        "severity": "SEV1", "title": "Catalog workers OOM: memory leak after v2.2.2", "signature": "MemoryError",
+        "version": "v2.2.2", "owner": "Marcus Chen", "diagnose_min": 52, "resolve_min": 88,
+        "alert": "catalog-api 45% 5xx (503) and rising latency. MemoryError: Cannot allocate 4194304 bytes: worker heap 256 MB exceeds container limit 256 MB.",
+        "timeline": [
+            (10, "Sofia Lindqvist", "Raised the container memory limit from 256 MB to 512 MB.", "failed"),
+            (48, "Sofia Lindqvist", "OOM returned 40 minutes later; heap grew linearly with request count.", None),
+            (52, "Marcus Chen", "Heap snapshot: the per-locale product cache added in v2.2.2 had no eviction.", None),
+            (60, "Marcus Chen", "Rolled back to v2.2.1 to stop the bleeding.", "worked"),
+            (85, "Marcus Chen", "Re-shipped the cache as a bounded LRU (maxsize 1024) in v2.2.3.", "worked"),
+        ],
+        "root_cause": "Unbounded in-process cache introduced in v2.2.2 grew with every request until the container OOMed.",
+        "fix": "Roll back the release that introduced the growth; replace unbounded caches with a bounded LRU.",
+        "postmortem": "More memory only delays an OOM from a leak. Signal: latency climbing steadily before MemoryError. "
+                      "Action item: memory growth alert (slope, not just threshold).",
+    },
+    {
+        "id": "INC-2038", "days_ago": 27, "hour": 10, "service": "checkout-api", "affected": ["checkout-api"],
+        "severity": "SEV1", "title": "Checkout 502: payment API key expired", "signature": "PaymentAuthError",
+        "version": "v2.2.3", "owner": "Aisha Okafor", "diagnose_min": 34, "resolve_min": 41,
+        "alert": "checkout-api 100% 5xx (502). PaymentAuthError: POST https://api.payfast.example/v1/charges -> 401 Unauthorized: api key pk_live_****9f2c expired.",
+        "timeline": [
+            (5, "Tomás Silva", "Assumed a PayFast outage; added client retries and opened a PayFast support ticket.", "failed"),
+            (30, "Aisha Okafor", "Noticed the 401 (not 5xx/timeout) - an auth problem on our side, not a PayFast outage.", None),
+            (34, "Aisha Okafor", "Found the live key hit its 90-day expiry; the rotation reminder went to a deleted mailbox.", None),
+            (38, "Aisha Okafor", "Rotated the key in the secrets manager and did a rolling restart of checkout-api.", "worked"),
+        ],
+        "root_cause": "PayFast live API key expired (90-day rotation missed).",
+        "fix": "Generate a new key in the PayFast dashboard, update PAYFAST_API_KEY in the secrets manager, rolling restart checkout-api.",
+        "postmortem": "Retries cannot fix a 401. Action items: key-expiry alert 14 days ahead; rotation owned by the payments team.",
+    },
+    {
+        "id": "INC-2039", "days_ago": 25, "hour": 3, "service": "export-api", "affected": ["export-api"],
+        "severity": "SEV2", "title": "Exports failing: disk full on log volume", "signature": "OSError",
+        "version": "v2.2.3", "owner": "Sofia Lindqvist", "diagnose_min": 15, "resolve_min": 35,
+        "alert": "export-api 100% 5xx. OSError: [Errno 28] No space left on device: '/var/exports/tmp'.",
+        "timeline": [
+            (8, "Tomás Silva", "Deleted temp files in /var/exports/tmp.", "failed"),
+            (15, "Sofia Lindqvist", "Disk refilled in minutes; debug logging left on after INC-2037 was writing 2 GB/hour.", None),
+            (25, "Sofia Lindqvist", "Turned debug logging off, fixed logrotate, expanded the volume to 50 GB.", "worked"),
+        ],
+        "root_cause": "Debug logging left enabled plus a broken logrotate config filled the shared volume.",
+        "fix": "Disable debug logging, repair logrotate, expand the volume.",
+        "postmortem": "Action item: disk usage alert at 80%; debug logging auto-expires after 1 hour.",
+    },
+    {
+        "id": "INC-2040", "days_ago": 23, "hour": 15, "service": "export-api", "affected": ["export-api"],
+        "severity": "SEV2", "title": "Order export 500s after v2.3.0: KeyError product_sku", "signature": "KeyError",
+        "version": "v2.3.0", "owner": "Diego Alvarez", "diagnose_min": 28, "resolve_min": 35,
+        "alert": "export-api 100% 5xx right after deploy v2.3.0. KeyError: 'product_sku' in export_orders "
+                 "(app.py: lines += [f\"{r['id']},{r[sku_key]},...\"]).",
+        "timeline": [
+            (6, "Kenji Watanabe", "Re-ran the failed export job.", "failed"),
+            (15, "Kenji Watanabe", "Started a hotfix to read both 'sku' and 'product_sku'.", "failed"),
+            (28, "Diego Alvarez", "v2.3.0 renamed sku -> product_sku in the exporter but the schema migration was not in the release.", None),
+            (30, "Diego Alvarez", "Rolled back to v2.2.4.", "worked"),
+        ],
+        "root_cause": "Release v2.3.0 shipped exporter code expecting the renamed column product_sku, but the migration renaming the column was not deployed.",
+        "fix": "Roll back to the previous version; ship code and migration together (expand/contract).",
+        "postmortem": "Second post-deploy incident where rollback was the answer (see INC-2035). Action items: "
+                      "deploy pipeline blocks releases whose code references columns missing in prod; one-click rollback.",
+    },
+    {
+        "id": "INC-2041", "days_ago": 21, "hour": 18, "service": "checkout-api", "affected": ["checkout-api"],
+        "severity": "SEV2", "title": "Intermittent checkout ConnectErrors: DNS", "signature": "ConnectError",
+        "version": "v2.2.4", "owner": "Sofia Lindqvist", "diagnose_min": 40, "resolve_min": 55,
+        "alert": "checkout-api 12-22% 5xx, flapping. httpx.ConnectError: [Errno -3] Temporary failure in name resolution (api.payfast.example).",
+        "timeline": [
+            (10, "Aisha Okafor", "Checked PayFast status: all green.", None),
+            (40, "Sofia Lindqvist", "CoreDNS pods at CPU limit; ndots:5 caused 5 lookups per external hostname.", None),
+            (48, "Sofia Lindqvist", "Scaled CoreDNS to 4 replicas and set ndots:2 for checkout pods.", "worked"),
+        ],
+        "root_cause": "Overloaded CoreDNS amplified by ndots:5.",
+        "fix": "Scale CoreDNS, lower ndots, use FQDNs with trailing dot for external APIs.",
+        "postmortem": "Action item: NodeLocal DNSCache.",
+    },
+    {
+        "id": "INC-2042", "days_ago": 19, "hour": 12, "service": "checkout-api", "affected": ["checkout-api"],
+        "severity": "SEV1", "title": "PayFast timeouts again", "signature": "PaymentGatewayTimeout",
+        "version": "v2.2.4", "owner": "Aisha Okafor", "diagnose_min": 9, "resolve_min": 18,
+        "alert": "checkout-api 71% 5xx (504). PaymentGatewayTimeout: POST https://api.payfast.example/v1/charges timed out after 3.0s (read timeout).",
+        "timeline": [
+            (4, "Tomás Silva", "Raised the PayFast timeout to 8s.", "failed"),
+            (9, "Aisha Okafor", "Recognised the INC-2032 pattern; reverted the timeout to 3s.", None),
+            (12, "Aisha Okafor", "Opened the payments circuit breaker and failed over to PayBridge.", "worked"),
+        ],
+        "root_cause": "PayFast upstream degradation (their incident PF-8812).",
+        "fix": "Circuit breaker + PayBridge failover, as in INC-2032. Never raise the timeout.",
+        "postmortem": "Resolved 3x faster than INC-2032 because Aisha remembered it. Someone again tried raising the timeout first.",
+    },
+    {
+        "id": "INC-2043", "days_ago": 17, "hour": 19, "service": "catalog-api", "affected": ["catalog-api"],
+        "severity": "SEV3", "title": "Catalog latency spike after cache flush", "signature": "HighLatency",
+        "version": "v2.3.1", "owner": "Marcus Chen", "diagnose_min": 20, "resolve_min": 30,
+        "alert": "catalog-api p95 1900 ms right after a Redis cache flush; DB CPU 95%.",
+        "timeline": [
+            (20, "Marcus Chen", "Cache stampede: thousands of concurrent misses for the same product keys.", None),
+            (26, "Marcus Chen", "Enabled request coalescing (single-flight) on product cache misses.", "worked"),
+        ],
+        "root_cause": "Cache stampede after a full cache flush.",
+        "fix": "Single-flight cache fills; never flush the whole product cache at peak.",
+        "postmortem": "Action item: staggered TTLs.",
+    },
+    {
+        "id": "INC-2044", "days_ago": 15, "hour": 10, "service": "export-api",
+        "affected": ["catalog-api", "checkout-api", "export-api"],
+        "severity": "SEV1", "title": "DB connection pool exhausted again (streaming export)", "signature": "TimeoutError",
+        "version": "v2.3.2", "owner": "Priya Raman", "diagnose_min": 31, "resolve_min": 44,
+        "alert": "All routes 503 (61% 5xx). TimeoutError: QueuePool limit of size 5 overflow 0 reached, connection timed out, timeout 2.00. db_pool_in_use pinned at 5.",
+        "timeline": [
+            (5, "Tomás Silva", "Restarted all ShopLite pods.", "failed"),
+            (12, "Tomás Silva", "Errors came back 7 minutes after the restart. Paged Priya.", None),
+            (22, "Priya Raman", "Recognised INC-2034; pg_stat_activity showed 'idle in transaction' connections from the new /export/stream endpoint.", None),
+            (31, "Priya Raman", "Streaming exporter released its connection only on success; client disconnects leaked it.", None),
+            (38, "Priya Raman", "Moved connection release into a finally block, deployed v2.3.3, restarted once to free leaked connections.", "worked"),
+        ],
+        "root_cause": "Connection leak in the new streaming export endpoint (no release on client disconnect).",
+        "fix": "Same playbook as INC-2034: find the leaking path in pg_stat_activity, release connections in finally/context manager, deploy, restart once.",
+        "postmortem": "Recurrence of INC-2034. Restarting pods failed AGAIN - it only buys minutes. The pool-saturation "
+                      "alert from INC-2034 was never built. Action items: build it; add a leak test to CI.",
+    },
+    {
+        "id": "INC-2045", "days_ago": 13, "hour": 17, "service": "checkout-api", "affected": ["checkout-api"],
+        "severity": "SEV2", "title": "Checkout slow: row lock contention on stock updates", "signature": "HighLatency",
+        "version": "v2.3.3", "owner": "Priya Raman", "diagnose_min": 26, "resolve_min": 45,
+        "alert": "checkout-api p95 4100 ms during a flash sale; 8% 5xx (lock timeout).",
+        "timeline": [
+            (8, "Tomás Silva", "Raised the DB pool size to 15.", "failed"),
+            (26, "Priya Raman", "pg_locks: hundreds of transactions waiting on the same products row (UPDATE stock).", None),
+            (40, "Priya Raman", "Switched the stock decrement to a single atomic UPDATE ... WHERE stock >= qty.", "worked"),
+        ],
+        "root_cause": "SELECT then UPDATE on hot product rows serialised all checkouts during the sale.",
+        "fix": "Atomic conditional UPDATE for stock; no read-modify-write.",
+        "postmortem": "A bigger pool increased contention. Action item: load-test flash sales.",
+    },
+    {
+        "id": "INC-2046", "days_ago": 11, "hour": 4, "service": "export-api", "affected": ["export-api"],
+        "severity": "SEV3", "title": "Export uploads AccessDenied", "signature": "ClientError",
+        "version": "v2.3.3", "owner": "Kenji Watanabe", "diagnose_min": 18, "resolve_min": 30,
+        "alert": "export-api 100% 5xx for the upload step. botocore ClientError: AccessDenied (ExpiredToken) on PutObject.",
+        "timeline": [
+            (18, "Kenji Watanabe", "Static STS session credentials in the export job had a 12h lifetime.", None),
+            (25, "Kenji Watanabe", "Switched the job to the pod's IAM role (auto-refreshing credentials).", "worked"),
+        ],
+        "root_cause": "Long-running job used static STS credentials that expired.",
+        "fix": "Use the workload IAM role instead of static session credentials.",
+        "postmortem": "Action item: ban static credentials in jobs.",
+    },
+    {
+        "id": "INC-2047", "days_ago": 9, "hour": 14, "service": "catalog-api", "affected": ["catalog-api"],
+        "severity": "SEV2", "title": "Catalog MemoryError: image resize leak", "signature": "MemoryError",
+        "version": "v2.3.4", "owner": "Marcus Chen", "diagnose_min": 22, "resolve_min": 40,
+        "alert": "catalog-api 33% 5xx (503), latency climbing. MemoryError: Cannot allocate 4194304 bytes: worker heap 256 MB exceeds container limit 256 MB.",
+        "timeline": [
+            (6, "Tomás Silva", "Restarted catalog-api pods.", "failed"),
+            (14, "Tomás Silva", "OOM again after 30 minutes of traffic.", None),
+            (22, "Marcus Chen", "Recognised the INC-2037 pattern; heap growth traced to Pillow 10.4 bumped in v2.3.4.", None),
+            (30, "Marcus Chen", "Rolled back to v2.3.3 (Pillow 10.3).", "worked"),
+        ],
+        "root_cause": "Memory leak in the upgraded image library.",
+        "fix": "Roll back the release that introduced the memory growth; pin the dependency.",
+        "postmortem": "Restarts only reset the clock on a leak. Diagnosed 2x faster than INC-2037 thanks to the heap-growth pattern.",
+    },
+    {
+        "id": "INC-2048", "days_ago": 7, "hour": 11, "service": "checkout-api", "affected": ["checkout-api"],
+        "severity": "SEV2", "title": "Fraud-check API 401: key expired", "signature": "PaymentAuthError",
+        "version": "v2.3.4", "owner": "Aisha Okafor", "diagnose_min": 8, "resolve_min": 15,
+        "alert": "checkout-api 38% 5xx (502). PaymentAuthError: fraud-check provider -> 401 Unauthorized: api key expired.",
+        "timeline": [
+            (8, "Aisha Okafor", "401 = expired credential, same class as INC-2038.", None),
+            (12, "Aisha Okafor", "Rotated the fraud-check key in the secrets manager, rolling restart.", "worked"),
+        ],
+        "root_cause": "Fraud-check provider key expired; not covered by the INC-2038 expiry alert.",
+        "fix": "Rotate the key in the secrets manager and rolling-restart checkout-api.",
+        "postmortem": "Extend expiry monitoring to all third-party keys.",
+    },
+    {
+        "id": "INC-2049", "days_ago": 4, "hour": 1, "service": "export-api", "affected": ["export-api"],
+        "severity": "SEV3", "title": "Duplicate rows in nightly export", "signature": "IntegrityError",
+        "version": "v2.3.5", "owner": "Kenji Watanabe", "diagnose_min": 30, "resolve_min": 45,
+        "alert": "export-api 18% 5xx. IntegrityError: duplicate key value violates unique constraint export_rows_pkey.",
+        "timeline": [
+            (30, "Kenji Watanabe", "Two export cron runs overlapped after the schedule moved to every 30 minutes.", None),
+            (40, "Kenji Watanabe", "Added a Postgres advisory lock so only one export runs at a time.", "worked"),
+        ],
+        "root_cause": "Overlapping cron runs.",
+        "fix": "pg_advisory_lock around the export job.",
+        "postmortem": "Action item: concurrencyPolicy: Forbid on the CronJob.",
+    },
+    {
+        "id": "INC-2050", "days_ago": 2, "hour": 16, "service": "checkout-api", "affected": ["checkout-api"],
+        "severity": "SEV2", "title": "Checkout 500s after v2.4.0 feature flag", "signature": "ValueError",
+        "version": "v2.4.0", "owner": "Diego Alvarez", "diagnose_min": 12, "resolve_min": 15,
+        "alert": "checkout-api 11% 5xx right after enabling flag new_tax_engine. ValueError: unsupported region code 'XK'.",
+        "timeline": [
+            (12, "Diego Alvarez", "Errors only for carts with region XK, starting exactly at the flag flip.", None),
+            (14, "Diego Alvarez", "Turned the new_tax_engine flag off.", "worked"),
+        ],
+        "root_cause": "New tax engine lacked a region code.",
+        "fix": "Disable the feature flag (rollback), then add the region.",
+        "postmortem": "Rollback-first worked again: 15 minutes.",
+    },
+]
